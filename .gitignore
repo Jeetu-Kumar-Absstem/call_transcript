@@ -1,0 +1,11 @@
+# Never commit secrets
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+venv/
+
+# Output files (optional — remove these lines if you want to track outputs)
+output_transcript.txt
+output_extracted.json

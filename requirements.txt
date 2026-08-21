@@ -1,12 +1,10 @@
 # ABSSTEM ASR V1 — Path A (API Only)
-# Install with: pip install -r requirements.txt
+# Install: pip install -r requirements.txt
 
-# HTTP requests — download WAV + call HuggingFace API
 requests>=2.28.0
-
-# Audio preprocessing — lightweight, no GPU needed
-torchaudio>=2.0.0
+soundfile>=0.12.0
+numpy>=1.24.0
 torch>=2.0.0
-
-# HuggingFace API client
+torchaudio>=2.0.0
 huggingface_hub>=0.20.0
+python-dotenv>=1.0.0

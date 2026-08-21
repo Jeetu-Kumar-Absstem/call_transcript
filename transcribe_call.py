@@ -2,19 +2,17 @@
 ABSSTEM AI Call Intelligence System
 Path A — API Only (no local model loading)
 
-ASR  : openai/whisper-large-v3  via HuggingFace Inference API
-LLM  : mistralai/Mistral-7B-Instruct-v0.3 via HuggingFace Inference API
+ASR : openai/whisper-large-v3  via HuggingFace Inference API
+LLM : mistralai/Mistral-7B-Instruct-v0.3 via HuggingFace Inference API
 
 Usage:
     python transcribe_call.py "https://telephonycloud.co.in/recordings/..."
+    python transcribe_call.py "https://..." --skip-llm
 
 Setup:
     1. pip install -r requirements.txt
-    2. Get HuggingFace token from https://huggingface.co/settings/tokens
-    3. Set environment variable:
-         Windows : set HF_TOKEN=hf_xxxxxxxxxxxx
-         Linux   : export HF_TOKEN=hf_xxxxxxxxxxxx
-    4. Run the script
+    2. In PowerShell: $env:HF_TOKEN="hf_xxxxxxxxxxxx"
+    3. Run the script
 """
 
 import argparse
@@ -25,15 +23,18 @@ import sys
 import tempfile
 
 import requests
-import torchaudio
+from huggingface_hub import InferenceClient
+import soundfile as sf
+import numpy as np
 import torch
+import torchaudio
 
-# Load .env file automatically if it exists
+# Load .env file if present
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv not installed, will fall back to system env variable
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,19 +49,16 @@ logger = logging.getLogger("absstem")
 
 ASR_MODEL  = "openai/whisper-large-v3"
 LLM_MODEL  = "mistralai/Mistral-7B-Instruct-v0.3"
-HF_API_URL = "https://api-inference.huggingface.co/models"
 
 
 def get_hf_token() -> str:
     token = os.environ.get("HF_TOKEN", "").strip()
     if not token:
         raise RuntimeError(
-            "\n\nHF_TOKEN environment variable is not set.\n"
-            "1. Go to https://huggingface.co/settings/tokens\n"
-            "2. Create a token with READ permission\n"
-            "3. Then run:\n"
-            "     Windows : set HF_TOKEN=hf_xxxxxxxxxxxx\n"
-            "     Linux   : export HF_TOKEN=hf_xxxxxxxxxxxx\n"
+            "\nHF_TOKEN is not set.\n"
+            "In PowerShell run:\n"
+            '  $env:HF_TOKEN="hf_your_token_here"\n'
+            "Then run the script again."
         )
     return token
 
@@ -81,7 +79,7 @@ def download_audio(url: str, dest_path: str) -> None:
     if response.status_code != 200:
         raise RuntimeError(
             f"HTTP {response.status_code} — could not download audio.\n"
-            f"Check that the TelephonyCloud URL is correct and accessible."
+            "Check the TelephonyCloud URL is correct."
         )
 
     with open(dest_path, "wb") as f:
@@ -89,23 +87,24 @@ def download_audio(url: str, dest_path: str) -> None:
             f.write(chunk)
 
     size_mb = os.path.getsize(dest_path) / (1024 * 1024)
-    print(f"  ✓ Downloaded — {size_mb:.2f} MB")
+    print(f"  Downloaded — {size_mb:.2f} MB")
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — Inspect audio
+# Step 2 — Inspect audio using soundfile
 # ---------------------------------------------------------------------------
 
 def inspect_audio(path: str) -> dict:
-    info       = torchaudio.info(path)
-    size_mb    = os.path.getsize(path) / (1024 * 1024)
-    duration   = info.num_frames / info.sample_rate
+    info     = sf.info(path)
+    size_mb  = os.path.getsize(path) / (1024 * 1024)
+    duration = info.duration
     mins, secs = divmod(int(duration), 60)
 
     print(f"\n  Audio info:")
     print(f"    Duration    : {mins:02d}:{secs:02d}")
-    print(f"    Sample rate : {info.sample_rate:,} Hz")
-    print(f"    Channels    : {info.num_channels}")
+    print(f"    Sample rate : {info.samplerate:,} Hz")
+    print(f"    Channels    : {info.channels}")
+    print(f"    Format      : {info.format}")
     print(f"    Size        : {size_mb:.2f} MB")
 
     if duration < 3:
@@ -113,35 +112,42 @@ def inspect_audio(path: str) -> dict:
 
     return {
         "duration_sec" : duration,
-        "sample_rate"  : info.sample_rate,
-        "num_channels" : info.num_channels,
+        "sample_rate"  : info.samplerate,
+        "num_channels" : info.channels,
         "size_mb"      : size_mb,
     }
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Preprocess: mono + 16 kHz
-# (runs on your CPU, lightweight — no GPU needed)
+# Step 3 — Preprocess: mono + 16 kHz using soundfile + numpy
+# No torchaudio.info needed — just load and resample
 # ---------------------------------------------------------------------------
 
 def preprocess_audio(src_path: str, dest_path: str) -> str:
     print("\nStep 2: Preprocessing audio ...")
 
-    waveform, sr = torchaudio.load(src_path)
+    # Read audio using soundfile
+    data, sr = sf.read(src_path, always_2d=True)  # shape: (frames, channels)
 
-    # Stereo → mono
-    if waveform.shape[0] > 1:
-        waveform = torch.mean(waveform, dim=0, keepdim=True)
-        logger.info("Converted stereo → mono")
+    # Stereo -> mono (average channels)
+    if data.shape[1] > 1:
+        data = data.mean(axis=1)
+        logger.info("Converted stereo -> mono")
+    else:
+        data = data[:, 0]
 
-    # Resample to 16 kHz
+    # Resample to 16000 Hz if needed
     if sr != 16000:
+        # Use torchaudio resampler
+        tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-        waveform  = resampler(waveform)
-        logger.info(f"Resampled {sr} Hz → 16000 Hz")
+        tensor = resampler(tensor)
+        data = tensor.squeeze(0).numpy()
+        logger.info(f"Resampled {sr} Hz -> 16000 Hz")
 
-    torchaudio.save(dest_path, waveform, 16000)
-    print("  ✓ Audio ready (mono, 16 kHz)")
+    # Save as 16-bit PCM WAV
+    sf.write(dest_path, data, 16000, subtype="PCM_16")
+    print("  Audio ready (mono, 16 kHz)")
     return dest_path
 
 
@@ -150,65 +156,36 @@ def preprocess_audio(src_path: str, dest_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def transcribe_audio(audio_path: str, hf_token: str) -> str:
-    print(f"\nStep 3: Transcribing via HuggingFace API ({ASR_MODEL}) ...")
-    print("  (this may take 1–3 minutes depending on call length)")
-
-    url     = f"{HF_API_URL}/{ASR_MODEL}"
-    headers = {"Authorization": f"Bearer {hf_token}"}
-
-    with open(audio_path, "rb") as f:
-        audio_bytes = f.read()
-
-    # Send with language hint for Hindi + return timestamps disabled
-    params = {
-        "wait_for_model": True,          # wait if model is loading, don't fail immediately
-        "language": "hi",               # hint: Hindi (Whisper auto-detects but this helps)
-        "task": "transcribe",           # transcribe, not translate
-    }
+    print(f"\nStep 3: Transcribing via HuggingFace InferenceClient ...")
+    print(f"  Model : {ASR_MODEL}")
+    print(f"  Note  : First call may take 1-2 min if model is cold-starting")
 
     try:
-        response = requests.post(
-            url,
-            headers=headers,
-            data=audio_bytes,
-            params=params,
-            timeout=300,                # 5 min timeout for long calls
+        client = InferenceClient(
+            provider="auto",
+            api_key=hf_token,
         )
-    except requests.exceptions.Timeout:
-        raise RuntimeError(
-            "Request timed out. The call audio may be very long.\n"
-            "Try a shorter test clip first."
+        result = client.automatic_speech_recognition(
+            audio_path,
+            model=ASR_MODEL,
         )
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"API request failed: {e}")
+        transcript = result.text.strip()
+    except Exception as e:
+        err = str(e)
+        if "401" in err or "Unauthorized" in err:
+            raise RuntimeError(
+                "HF API returned 401 Unauthorized.\n"
+                "Your token may be wrong or expired.\n"
+                "Check: https://huggingface.co/settings/tokens"
+            )
+        if "503" in err:
+            raise RuntimeError(
+                "HF API returned 503 — model is loading on their servers.\n"
+                "Wait 30 seconds and try again."
+            )
+        raise RuntimeError(f"ASR request failed: {e}")
 
-    if response.status_code == 401:
-        raise RuntimeError(
-            "HuggingFace API returned 401 Unauthorized.\n"
-            "Check your HF_TOKEN is correct and has READ permission."
-        )
-    if response.status_code == 503:
-        raise RuntimeError(
-            "HuggingFace API returned 503 — model is loading on their servers.\n"
-            "Wait 30 seconds and try again. This happens on first call of the day."
-        )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"HuggingFace ASR API error {response.status_code}:\n{response.text}"
-        )
-
-    result = response.json()
-
-    # Whisper API returns {"text": "..."}
-    if isinstance(result, dict) and "text" in result:
-        transcript = result["text"].strip()
-    elif isinstance(result, list) and len(result) > 0:
-        # Some versions return a list of chunks
-        transcript = " ".join(chunk.get("text", "") for chunk in result).strip()
-    else:
-        raise RuntimeError(f"Unexpected API response format:\n{result}")
-
-    print("  ✓ Transcription received")
+    print("  Transcription received")
     return transcript
 
 
@@ -216,18 +193,17 @@ def transcribe_audio(audio_path: str, hf_token: str) -> str:
 # Step 5 — LLM Extraction via HuggingFace API (Mistral)
 # ---------------------------------------------------------------------------
 
-EXTRACTION_PROMPT = """You are an AI assistant for ABSSTEM Technologies, a company that sells nitrogen plants, oxygen plants, and gas generation systems.
+EXTRACTION_PROMPT = """You are an AI assistant for ABSSTEM Technologies, which sells nitrogen plants, oxygen plants, and gas generation systems.
 
-Below is a raw transcript of a sales call. The transcript may be in Hindi, English, or Hinglish (mixed Hindi-English).
+Below is a raw transcript of a sales call. It may be in Hindi, English, or Hinglish (mixed).
 
-Your job is to extract structured information from this transcript and return ONLY a valid JSON object. Do not add any explanation or text outside the JSON.
-
-If a field is not mentioned in the transcript, set it to null.
+Extract structured information and return ONLY a valid JSON object. No explanation outside the JSON.
+If a field is not mentioned, set it to null.
 
 Transcript:
 {transcript}
 
-Return this exact JSON structure:
+Return exactly this JSON:
 {{
   "customer": {{
     "name": null,
@@ -261,70 +237,43 @@ Return this exact JSON structure:
 
 
 def extract_information(transcript: str, hf_token: str) -> dict:
-    print(f"\nStep 4: Extracting information via HuggingFace API ({LLM_MODEL}) ...")
-
-    url     = f"{HF_API_URL}/{LLM_MODEL}"
-    headers = {
-        "Authorization": f"Bearer {hf_token}",
-        "Content-Type" : "application/json",
-    }
-
-    prompt = EXTRACTION_PROMPT.format(transcript=transcript)
-
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens"  : 600,
-            "temperature"     : 0.1,    # low temp = more deterministic JSON
-            "return_full_text": False,  # return only new tokens, not the prompt
-        },
-        "options": {
-            "wait_for_model": True,
-        },
-    }
+    print(f"\nStep 4: Extracting information via LLM API ...")
+    print(f"  Model : {LLM_MODEL}")
 
     try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=120,
+        client = InferenceClient(
+            provider="auto",
+            api_key=hf_token,
         )
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"LLM API request failed: {e}")
-
-    if response.status_code != 200:
-        logger.warning(
-            f"LLM API returned {response.status_code} — skipping extraction.\n"
-            f"Raw response: {response.text[:300]}"
+        response = client.text_generation(
+            prompt=EXTRACTION_PROMPT.format(transcript=transcript),
+            model=LLM_MODEL,
+            max_new_tokens=600,
+            temperature=0.1,
         )
+        raw_text = response if isinstance(response, str) else str(response)
+    except Exception as e:
+        err = str(e)
+        if LLM_MODEL not in err and ("not available" in err.lower() or "not supported" in err.lower() or "no provider" in err.lower()):
+            logger.warning(
+                f"LLM model '{LLM_MODEL}' is not available through any provider. "
+                f"Original error: {e}"
+            )
+        else:
+            logger.warning(f"LLM API request failed: {e}")
         return {}
 
-    result = response.json()
-
-    # Mistral returns [{"generated_text": "..."}]
-    if isinstance(result, list) and len(result) > 0:
-        raw_text = result[0].get("generated_text", "")
-    elif isinstance(result, dict):
-        raw_text = result.get("generated_text", "")
-    else:
-        logger.warning(f"Unexpected LLM response format: {result}")
-        return {}
-
-    # Parse JSON from the response
     try:
-        # Find the JSON block in the response
-        start = raw_text.find("{")
-        end   = raw_text.rfind("}") + 1
+        start  = raw_text.find("{")
+        end    = raw_text.rfind("}") + 1
         if start == -1 or end == 0:
-            raise ValueError("No JSON found in LLM response")
-        json_str    = raw_text[start:end]
-        extracted   = json.loads(json_str)
-        print("  ✓ Information extracted")
+            raise ValueError("No JSON in LLM response")
+        extracted = json.loads(raw_text[start:end])
+        print("  Extraction complete")
         return extracted
     except (json.JSONDecodeError, ValueError) as e:
-        logger.warning(f"Could not parse LLM JSON output: {e}")
-        logger.warning(f"Raw LLM output was:\n{raw_text[:500]}")
+        logger.warning(f"Could not parse LLM JSON: {e}")
+        logger.warning(f"Raw LLM output:\n{raw_text[:400]}")
         return {}
 
 
@@ -332,19 +281,21 @@ def extract_information(transcript: str, hf_token: str) -> dict:
 # Step 6 — Save outputs
 # ---------------------------------------------------------------------------
 
-def save_outputs(transcript: str, extracted: dict, base_name: str = "output") -> None:
-    # Save raw transcript
-    txt_path = f"{base_name}_transcript.txt"
+def save_outputs(transcript: str, extracted: dict) -> None:
+    print("\n" + "=" * 50)
+    print("  SAVING OUTPUT")
+    print("=" * 50)
+
+    txt_path = "output_transcript.txt"
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(transcript)
-    print(f"\n  Transcript saved : {os.path.abspath(txt_path)}")
+    print(f"  Transcript : {os.path.abspath(txt_path)}")
 
-    # Save extracted JSON
     if extracted:
-        json_path = f"{base_name}_extracted.json"
+        json_path = "output_extracted.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(extracted, f, indent=2, ensure_ascii=False)
-        print(f"  Extracted JSON   : {os.path.abspath(json_path)}")
+        print(f"  Extracted  : {os.path.abspath(json_path)}")
 
 
 # ---------------------------------------------------------------------------
@@ -366,12 +317,12 @@ def run_pipeline(wav_url: str, skip_llm: bool = False) -> None:
         download_audio(wav_url, raw_wav)
 
         # 2. Inspect
-        inspect_audio(raw_wav)
+        meta = inspect_audio(raw_wav)
 
         # 3. Preprocess
         preprocess_audio(raw_wav, processed_wav)
 
-        # 4. Transcribe via API
+        # 4. Transcribe
         transcript = transcribe_audio(processed_wav, hf_token)
 
         # 5. Print transcript
@@ -393,12 +344,9 @@ def run_pipeline(wav_url: str, skip_llm: bool = False) -> None:
                 print(json.dumps(extracted, indent=2, ensure_ascii=False))
 
         # 7. Save
-        print("\n" + "=" * 50)
-        print("  SAVING OUTPUT")
-        print("=" * 50)
         save_outputs(transcript, extracted)
 
-    print("\n✓ Done.\n")
+    print("\nDone.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -407,16 +355,13 @@ def run_pipeline(wav_url: str, skip_llm: bool = False) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ABSSTEM V1 — Transcribe TelephonyCloud call via HuggingFace API"
+        description="ABSSTEM — Transcribe TelephonyCloud call via HuggingFace API"
     )
-    parser.add_argument(
-        "url",
-        help="TelephonyCloud WAV URL"
-    )
+    parser.add_argument("url", help="TelephonyCloud WAV URL")
     parser.add_argument(
         "--skip-llm",
         action="store_true",
-        help="Only transcribe, skip LLM extraction step"
+        help="Only transcribe, skip LLM extraction"
     )
     args = parser.parse_args()
 
